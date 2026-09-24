@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     SmallInteger,
     String,
@@ -17,6 +18,7 @@ from sqlalchemy import (
     Time,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,6 +35,10 @@ if TYPE_CHECKING:
 class Business(TimestampMixin, Base):
     __tablename__ = "businesses"
 
+    __table_args__ = (
+        Index("ix_businesses_location", "latitude", "longitude"),
+    )
+
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     owner_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -46,8 +52,12 @@ class Business(TimestampMixin, Base):
     address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(9, 6), nullable=True)
     longitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(9, 6), nullable=True)
-    timezone: Mapped[str] = mapped_column(String(64), default="UTC", nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="UTC", server_default=text("'UTC'"), nullable=False
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
 
     owner: Mapped["User"] = relationship("User", back_populates="businesses")
     photos: Mapped[list["BusinessPhoto"]] = relationship(
@@ -77,7 +87,9 @@ class BusinessPhoto(Base):
         nullable=False,
     )
     photo_url: Mapped[str] = mapped_column(String(500), nullable=False)
-    position: Mapped[int] = mapped_column(SmallInteger, default=0, nullable=False)
+    position: Mapped[int] = mapped_column(
+        SmallInteger, default=0, server_default=text("0"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -97,7 +109,9 @@ class BusinessHour(Base):
     day_of_week: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     open_time: Mapped[Optional[object]] = mapped_column(Time, nullable=True)
     close_time: Mapped[Optional[object]] = mapped_column(Time, nullable=True)
-    is_closed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    is_closed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
 
     __table_args__ = (
         # One hours row per weekday per business.

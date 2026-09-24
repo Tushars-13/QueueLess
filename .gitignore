@@ -33,6 +33,7 @@ build/
 *.db
 *.sqlite3
 *.sqlite
+.pgdata/
 
 # --- Logs ---
 *.log

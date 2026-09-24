@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Table,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,7 +43,9 @@ class Staff(TimestampMixin, Base):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    available: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    available: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("business_id", "name", name="uq_staff_business_name"),

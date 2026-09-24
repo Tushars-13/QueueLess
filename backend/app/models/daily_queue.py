@@ -3,7 +3,7 @@
 from datetime import date
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Date, Enum, ForeignKey, UniqueConstraint
+from sqlalchemy import BigInteger, Date, Enum, ForeignKey, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -35,10 +35,13 @@ class DailyQueue(TimestampMixin, Base):
             validate_strings=True,
         ),
         default=DailyQueueStatus.CLOSED,
+        server_default=text("'CLOSED'::daily_queue_status"),
         nullable=False,
     )
     # Token counter used for concurrency-safe daily token allocation.
-    last_token: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    last_token: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default=text("0"), nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint(

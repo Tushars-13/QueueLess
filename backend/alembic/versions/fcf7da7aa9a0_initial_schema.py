@@ -16,6 +16,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
@@ -27,6 +28,8 @@ depends_on: Union[str, Sequence[str], None] = None
 # All table PKs are BIGINT (BIGSERIAL) per database-design.md.
 
 def upgrade() -> None:
+    op.execute("CREATE EXTENSION IF NOT EXISTS citext")
+
     # --- Enumerated types ---------------------------------------------------
     user_role = sa.Enum(
         'CUSTOMER', 'BUSINESS_OWNER', name='user_role'
@@ -49,7 +52,7 @@ def upgrade() -> None:
     op.create_table(
         'users',
         sa.Column('id', sa.BigInteger(), nullable=False),
-        sa.Column('email', sa.String(length=254), nullable=False),
+        sa.Column('email', postgresql.CITEXT(), nullable=False),
         sa.Column('password_hash', sa.String(length=255), nullable=False),
         sa.Column('full_name', sa.String(length=255), nullable=False),
         sa.Column('phone', sa.String(length=32), nullable=True),
@@ -85,8 +88,18 @@ def upgrade() -> None:
         sa.Column('address', sa.String(length=255), nullable=True),
         sa.Column('latitude', sa.Numeric(9, 6), nullable=True),
         sa.Column('longitude', sa.Numeric(9, 6), nullable=True),
-        sa.Column('timezone', sa.String(length=64), nullable=False),
-        sa.Column('is_active', sa.Boolean(), nullable=False),
+        sa.Column(
+            'timezone',
+            sa.String(length=64),
+            server_default=sa.text("'UTC'"),
+            nullable=False,
+        ),
+        sa.Column(
+            'is_active',
+            sa.Boolean(),
+            server_default=sa.text('true'),
+            nullable=False,
+        ),
         sa.Column(
             'created_at',
             sa.DateTime(timezone=True),
@@ -111,6 +124,12 @@ def upgrade() -> None:
         'ix_businesses_category', 'businesses', ['category'], unique=False
     )
     op.create_index(
+        'ix_businesses_location',
+        'businesses',
+        ['latitude', 'longitude'],
+        unique=False,
+    )
+    op.create_index(
         'ix_businesses_owner_id', 'businesses', ['owner_id'], unique=False
     )
 
@@ -120,7 +139,12 @@ def upgrade() -> None:
         sa.Column('id', sa.BigInteger(), nullable=False),
         sa.Column('business_id', sa.BigInteger(), nullable=False),
         sa.Column('photo_url', sa.String(length=500), nullable=False),
-        sa.Column('position', sa.SmallInteger(), nullable=False),
+        sa.Column(
+            'position',
+            sa.SmallInteger(),
+            server_default=sa.text('0'),
+            nullable=False,
+        ),
         sa.Column(
             'created_at',
             sa.DateTime(timezone=True),
@@ -144,7 +168,12 @@ def upgrade() -> None:
         sa.Column('day_of_week', sa.SmallInteger(), nullable=False),
         sa.Column('open_time', sa.Time(), nullable=True),
         sa.Column('close_time', sa.Time(), nullable=True),
-        sa.Column('is_closed', sa.Boolean(), nullable=False),
+        sa.Column(
+            'is_closed',
+            sa.Boolean(),
+            server_default=sa.text('false'),
+            nullable=False,
+        ),
         sa.CheckConstraint(
             'day_of_week BETWEEN 0 AND 6',
             name=op.f('ck_business_hours_day_of_week_range'),
@@ -172,7 +201,12 @@ def upgrade() -> None:
         sa.Column('description', sa.Text(), nullable=True),
         sa.Column('price', sa.Numeric(10, 2), nullable=True),
         sa.Column('duration_minutes', sa.Integer(), nullable=True),
-        sa.Column('is_active', sa.Boolean(), nullable=False),
+        sa.Column(
+            'is_active',
+            sa.Boolean(),
+            server_default=sa.text('true'),
+            nullable=False,
+        ),
         sa.Column(
             'created_at',
             sa.DateTime(timezone=True),
@@ -204,7 +238,12 @@ def upgrade() -> None:
         sa.Column('business_id', sa.BigInteger(), nullable=False),
         sa.Column('name', sa.String(length=255), nullable=False),
         sa.Column('title', sa.String(length=255), nullable=True),
-        sa.Column('available', sa.Boolean(), nullable=False),
+        sa.Column(
+            'available',
+            sa.Boolean(),
+            server_default=sa.text('true'),
+            nullable=False,
+        ),
         sa.Column(
             'created_at',
             sa.DateTime(timezone=True),
@@ -238,9 +277,15 @@ def upgrade() -> None:
         sa.Column(
             'status',
             daily_queue_status,
+            server_default=sa.text("'CLOSED'::daily_queue_status"),
             nullable=False,
         ),
-        sa.Column('last_token', sa.BigInteger(), nullable=False),
+        sa.Column(
+            'last_token',
+            sa.BigInteger(),
+            server_default=sa.text('0'),
+            nullable=False,
+        ),
         sa.Column(
             'created_at',
             sa.DateTime(timezone=True),
@@ -284,6 +329,7 @@ def upgrade() -> None:
         sa.Column(
             'status',
             queue_entry_status,
+            server_default=sa.text("'REQUESTED'::queue_entry_status"),
             nullable=False,
         ),
         sa.Column('token_number', sa.BigInteger(), nullable=True),
@@ -336,12 +382,6 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id', name=op.f('pk_queue_entries')),
     )
     op.create_index(
-        'ix_queue_entries_customer_id',
-        'queue_entries',
-        ['customer_id'],
-        unique=False,
-    )
-    op.create_index(
         'ix_queue_entries_daily_queue_id',
         'queue_entries',
         ['daily_queue_id'],
@@ -354,12 +394,6 @@ def upgrade() -> None:
         unique=False,
     )
     op.create_index(
-        'ix_queue_entries_status',
-        'queue_entries',
-        ['status'],
-        unique=False,
-    )
-    op.create_index(
         'ix_queue_entries_staff_id',
         'queue_entries',
         ['staff_id'],
@@ -369,7 +403,22 @@ def upgrade() -> None:
     op.create_index(
         'ix_queue_entries_fifo',
         'queue_entries',
-        ['daily_queue_id', 'staff_id', 'accepted_at', 'id'],
+        ['daily_queue_id', 'staff_id', 'status', 'accepted_at', 'id'],
+        unique=False,
+    )
+    # Active entries in a specific staff/general queue.
+    op.create_index(
+        'ix_queue_entries_active',
+        'queue_entries',
+        ['daily_queue_id', 'staff_id'],
+        unique=False,
+        postgresql_where=sa.text("status IN ('WAITING', 'CALLED', 'IN_SERVICE')"),
+    )
+    # Customer's own entries (dashboard + already-in-queue check).
+    op.create_index(
+        'ix_queue_entries_customer_status',
+        'queue_entries',
+        ['customer_id', 'status'],
         unique=False,
     )
     # Token must be unique within a daily queue (only for issued tokens).
@@ -427,7 +476,12 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column('queue_entry_id', sa.BigInteger(), nullable=True),
-        sa.Column('is_read', sa.Boolean(), nullable=False),
+        sa.Column(
+            'is_read',
+            sa.Boolean(),
+            server_default=sa.text('false'),
+            nullable=False,
+        ),
         sa.Column(
             'created_at',
             sa.DateTime(timezone=True),
@@ -449,9 +503,9 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint('id', name=op.f('pk_notifications')),
     )
     op.create_index(
-        'ix_notifications_user_id',
+        'ix_notifications_user_status',
         'notifications',
-        ['user_id'],
+        ['user_id', 'is_read'],
         unique=False,
     )
 
@@ -511,19 +565,19 @@ def downgrade() -> None:
     op.drop_index('ix_queue_events_created_at', table_name='queue_events')
     op.drop_table('queue_events')
 
-    op.drop_index('ix_notifications_user_id', table_name='notifications')
+    op.drop_index('ix_notifications_user_status', table_name='notifications')
     op.drop_table('notifications')
 
     op.drop_table('staff_services')
 
     op.drop_index('uq_queue_entries_customer_active', table_name='queue_entries')
     op.drop_index('uq_queue_entries_token', table_name='queue_entries')
+    op.drop_index('ix_queue_entries_active', table_name='queue_entries')
+    op.drop_index('ix_queue_entries_customer_status', table_name='queue_entries')
     op.drop_index('ix_queue_entries_fifo', table_name='queue_entries')
     op.drop_index('ix_queue_entries_staff_id', table_name='queue_entries')
-    op.drop_index('ix_queue_entries_status', table_name='queue_entries')
     op.drop_index('ix_queue_entries_service_id', table_name='queue_entries')
     op.drop_index('ix_queue_entries_daily_queue_id', table_name='queue_entries')
-    op.drop_index('ix_queue_entries_customer_id', table_name='queue_entries')
     op.drop_table('queue_entries')
 
     op.drop_index('ix_daily_queues_business_id', table_name='daily_queues')
@@ -539,9 +593,9 @@ def downgrade() -> None:
 
     op.drop_index('ix_businesses_owner_id', table_name='businesses')
     op.drop_index('ix_businesses_category', table_name='businesses')
+    op.drop_index('ix_businesses_location', table_name='businesses')
     op.drop_table('businesses')
 
-    op.drop_index('ix_users_email', table_name='users')
     op.drop_table('users')
 
     # --- Enumerated types ---------------------------------------------------
@@ -553,3 +607,5 @@ def downgrade() -> None:
     daily_queue_status.drop(op.get_bind(), checkfirst=True)
     user_role = sa.Enum(name='user_role')
     user_role.drop(op.get_bind(), checkfirst=True)
+
+    op.execute('DROP EXTENSION IF EXISTS citext')

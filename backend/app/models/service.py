@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,7 +36,9 @@ class Service(TimestampMixin, Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     duration_minutes: Mapped[Optional[int]] = mapped_column(nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=text("true"), nullable=False
+    )
 
     __table_args__ = (
         UniqueConstraint("business_id", "name", name="uq_services_business_name"),

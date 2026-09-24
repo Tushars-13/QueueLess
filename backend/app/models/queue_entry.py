@@ -52,7 +52,6 @@ class QueueEntry(TimestampMixin, Base):
         BigInteger,
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
-        index=True,
     )
     service_id: Mapped[int] = mapped_column(
         BigInteger,
@@ -76,8 +75,8 @@ class QueueEntry(TimestampMixin, Base):
             validate_strings=True,
         ),
         default=QueueEntryStatus.REQUESTED,
+        server_default=text("'REQUESTED'::queue_entry_status"),
         nullable=False,
-        index=True,
     )
     # Assigned on acceptance; NULL until then.
     token_number: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
@@ -120,8 +119,22 @@ class QueueEntry(TimestampMixin, Base):
             "ix_queue_entries_fifo",
             "daily_queue_id",
             "staff_id",
+            "status",
             "accepted_at",
             "id",
+        ),
+        Index(
+            "ix_queue_entries_active",
+            "daily_queue_id",
+            "staff_id",
+            postgresql_where=text(
+                "status IN ('WAITING', 'CALLED', 'IN_SERVICE')"
+            ),
+        ),
+        Index(
+            "ix_queue_entries_customer_status",
+            "customer_id",
+            "status",
         ),
     )
 
