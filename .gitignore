@@ -1,0 +1,46 @@
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# --- Virtual environments (any location) ---
+.venv/
+venv/
+env/
+
+# --- Node / Next.js (frontend) ---
+node_modules/
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# --- Local databases ---
+*.db
+*.sqlite3
+*.sqlite
+
+# --- Logs ---
+*.log
+logs/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
