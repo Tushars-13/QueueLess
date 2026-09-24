@@ -76,10 +76,11 @@ def prepared_database() -> None:
 
 
 @pytest.fixture(autouse=True)
-async def clean_users(prepared_database: None) -> None:
-    """Truncate ``users`` before each test for full isolation."""
+async def clean_db(prepared_database: None) -> None:
+    """Truncate tables before each test for full isolation (FK-safe order)."""
     async with async_session_factory() as session:
-        await session.execute(text("DELETE FROM users"))
+        for table in ("business_hours", "businesses", "users"):
+            await session.execute(text(f"DELETE FROM {table}"))
         await session.commit()
     yield
 

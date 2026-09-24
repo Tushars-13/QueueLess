@@ -8,9 +8,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import AuthenticationError
+from app.core.exceptions import AuthenticationError, ForbiddenError
 from app.core.security import decode_access_token
 from app.db.session import get_db_session
+from app.models.enums import UserRole
 from app.models.user import User
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -56,3 +57,16 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+async def get_current_owner(current_user: CurrentUser) -> User:
+    """Require an authenticated user with the BUSINESS_OWNER role."""
+    if current_user.role != UserRole.BUSINESS_OWNER:
+        raise ForbiddenError(
+            "Only business owners can access business endpoints",
+            code="owner_required",
+        )
+    return current_user
+
+
+CurrentOwner = Annotated[User, Depends(get_current_owner)]

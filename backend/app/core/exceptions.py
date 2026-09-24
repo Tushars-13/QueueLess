@@ -43,6 +43,11 @@ class AuthenticationError(AppError):
         )
 
 
+class ForbiddenError(AppError):
+    def __init__(self, message: str, *, code: str = "forbidden") -> None:
+        super().__init__(message, code=code, status_code=status.HTTP_403_FORBIDDEN)
+
+
 class DatabaseError(AppError):
     def __init__(self, message: str = "Database error") -> None:
         super().__init__(
@@ -57,6 +62,27 @@ def _error_body(code: str, message: str, details: Optional[Any] = None) -> dict[
     if details is not None:
         body["details"] = details
     return body
+
+
+def _json_safe(value: Any) -> Any:
+    """Coerce arbitrary values into a JSON-serializable form (worst case str)."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
+def _serializable_validation_details(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Copy pydantic validation errors, coercing values into JSON-safe forms."""
+
+    return [
+        {key: _json_safe(value) for key, value in dict(error).items()}
+        for error in details
+    ]
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -78,7 +104,7 @@ def register_exception_handlers(app: FastAPI) -> None:
             content=_error_body(
                 "validation_error",
                 "Request validation failed",
-                details=exc.errors(),
+                details=_serializable_validation_details(exc.errors()),
             ),
         )
 
