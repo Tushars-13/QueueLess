@@ -79,7 +79,7 @@ def prepared_database() -> None:
 async def clean_db(prepared_database: None) -> None:
     """Truncate tables before each test for full isolation (FK-safe order)."""
     async with async_session_factory() as session:
-        for table in ("business_hours", "businesses", "users"):
+        for table in ("staff_services", "services", "business_hours", "businesses", "users"):
             await session.execute(text(f"DELETE FROM {table}"))
         await session.commit()
     yield
