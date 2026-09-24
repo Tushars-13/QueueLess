@@ -34,6 +34,15 @@ class ConflictError(AppError):
         super().__init__(message, code=code, status_code=status.HTTP_409_CONFLICT)
 
 
+class AuthenticationError(AppError):
+    def __init__(
+        self, message: str, *, code: str = "authentication_error"
+    ) -> None:
+        super().__init__(
+            message, code=code, status_code=status.HTTP_401_UNAUTHORIZED
+        )
+
+
 class DatabaseError(AppError):
     def __init__(self, message: str = "Database error") -> None:
         super().__init__(

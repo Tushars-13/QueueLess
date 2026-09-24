@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     database_max_overflow: int = 20
     database_pool_timeout: int = 30
 
+    # --- Authentication (JWT) ---
+    jwt_secret_key: str = "change-me-queueless-dev-only-jwt-secret-key"
+    jwt_algorithm: str = "HS256"
+    jwt_access_token_expire_minutes: int = 30
+
     @property
     def database_url(self) -> str:
         """Build the async (asyncpg) SQLAlchemy DSN from parts."""
