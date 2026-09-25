@@ -28,6 +28,29 @@ class QueueEntryResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class QueueEntryTrackingResponse(BaseModel):
+    entry_id: int
+    token_number: int | None
+    status: QueueEntryStatus
+    queue_date: date
+    queue_status: DailyQueueStatus
+    service_id: int
+    service_name: str
+    duration_minutes: int | None
+    staff_id: int | None
+    staff_name: str | None
+    position: int | None
+    customers_ahead: int | None
+    estimated_wait_minutes: int | None
+    recommended_arrival_at: datetime | None
+    requested_at: datetime
+    accepted_at: datetime | None
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DailyQueueResponse(BaseModel):
     id: int
     business_id: int

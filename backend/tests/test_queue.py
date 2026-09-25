@@ -227,6 +227,20 @@ async def _cancel_entry(
     return response.json()
 
 
+async def _track_entry(
+    client: AsyncClient,
+    business_id: int,
+    token: str,
+    entry_id: int,
+) -> dict:
+    response = await client.get(
+        f"{BUSINESSES_PATH}/{business_id}/queue/entries/{entry_id}",
+        headers=_bearer(token),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 async def _entry_snapshot(entry_id: int) -> dict:
     async with async_session_factory() as session:
         result = await session.execute(
@@ -309,6 +323,38 @@ async def _setup_waiting_entry(
     )
     accepted = await _accept_entry(client, owner["access_token"], entry["id"])
     return owner, business, service, customer, accepted
+
+
+async def _setup_staff_waiting_entry(
+    client: AsyncClient,
+    *,
+    owner_payload: dict = OWNER_A,
+    customer_payload: dict = CUSTOMER_A,
+    business_name: str = "Staff Queue Salon",
+    staff_name: str = "Alex",
+) -> tuple[dict, dict, dict, dict, dict, dict]:
+    owner, business, service = await _setup_business_with_service(
+        client,
+        owner_payload=owner_payload,
+        business_name=business_name,
+    )
+    staff = await _create_staff(
+        client, owner["access_token"], name=staff_name
+    )
+    await _assign_staff_service(
+        client, owner["access_token"], staff["id"], service["id"]
+    )
+    customer = await _register(client, customer_payload)
+    await _open_queue(client, owner["access_token"])
+    entry = await _join_queue(
+        client,
+        business["id"],
+        customer["access_token"],
+        service["id"],
+        staff_id=staff["id"],
+    )
+    accepted = await _accept_entry(client, owner["access_token"], entry["id"])
+    return owner, business, service, staff, customer, accepted
 
 
 async def test_daily_queue_uses_business_local_date(
@@ -1252,3 +1298,291 @@ async def test_concurrent_owner_actions_have_one_winner(client: AsyncClient) -> 
     snapshot = await _entry_snapshot(entry["id"])
     assert snapshot["status"] == QueueEntryStatus.CALLED
     assert len(await _event_snapshot(entry["id"])) == 4
+
+
+async def test_customer_can_track_own_active_entry(client: AsyncClient) -> None:
+    _owner, business, service, staff, customer, entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+
+    body = await _track_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    assert body["entry_id"] == entry["id"]
+    assert body["token_number"] == entry["token_number"]
+    assert body["status"] == "WAITING"
+    assert body["queue_status"] == "OPEN"
+    assert body["service_id"] == service["id"]
+    assert body["service_name"] == service["name"]
+    assert body["duration_minutes"] == 30
+    assert body["staff_id"] == staff["id"]
+    assert body["staff_name"] == staff["name"]
+    assert body["position"] == 1
+    assert body["customers_ahead"] == 0
+    assert body["estimated_wait_minutes"] == 0
+    assert body["recommended_arrival_at"] is not None
+    assert body["requested_at"] is not None
+    assert body["accepted_at"] is not None
+    assert body["started_at"] is None
+    assert body["completed_at"] is None
+    assert "customer_id" not in body
+    assert "daily_queue_id" not in body
+    assert "notes" not in body
+
+
+async def test_customer_can_track_terminal_entry_after_queue_closure(
+    client: AsyncClient,
+) -> None:
+    owner, business, _service, _staff, customer, entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+    await _call_entry(client, owner["access_token"], entry["id"])
+    await _start_service_entry(client, owner["access_token"], entry["id"])
+    await _complete_entry(client, owner["access_token"], entry["id"])
+    await _close_queue(client, owner["access_token"])
+
+    body = await _track_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    assert body["status"] == "COMPLETED"
+    assert body["queue_status"] == "CLOSED"
+    assert body["position"] is None
+    assert body["customers_ahead"] is None
+    assert body["estimated_wait_minutes"] is None
+    assert body["recommended_arrival_at"] is None
+    assert body["completed_at"] is not None
+
+
+async def test_customer_cannot_track_another_customers_entry(
+    client: AsyncClient,
+) -> None:
+    _owner, business, _service, _staff, _customer, entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+    other_customer = await _register(client, CUSTOMER_B)
+
+    response = await client.get(
+        f"{BUSINESSES_PATH}/{business['id']}/queue/entries/{entry['id']}",
+        headers=_bearer(other_customer["access_token"]),
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["code"] == "not_entry_owner"
+
+
+async def test_customer_cannot_track_across_businesses(client: AsyncClient) -> None:
+    _owner_a, _business_a, _service_a, _staff_a, customer, entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+    _owner_b, business_b, _service_b = await _setup_business_with_service(
+        client,
+        owner_payload=OWNER_B,
+        business_name="Other Staff Queue Salon",
+    )
+
+    response = await client.get(
+        f"{BUSINESSES_PATH}/{business_b['id']}/queue/entries/{entry['id']}",
+        headers=_bearer(customer["access_token"]),
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["code"] == "queue_entry_not_found"
+
+
+async def test_customer_tracking_position_and_customers_ahead(
+    client: AsyncClient,
+) -> None:
+    owner, business, service, staff, first_customer, first = (
+        await _setup_staff_waiting_entry(client)
+    )
+    second_customer = await _register(client, CUSTOMER_B)
+    second = await _join_queue(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        service["id"],
+        staff_id=staff["id"],
+    )
+    await _accept_entry(client, owner["access_token"], second["id"])
+
+    body = await _track_entry(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        second["id"],
+    )
+
+    assert first["id"] != body["entry_id"]
+    assert body["position"] == 2
+    assert body["customers_ahead"] == 1
+    assert first_customer["user"]["id"] != second_customer["user"]["id"]
+
+
+async def test_customer_tracking_position_changes_after_earlier_entry_leaves(
+    client: AsyncClient,
+) -> None:
+    owner, business, service, staff, first_customer, first = (
+        await _setup_staff_waiting_entry(client)
+    )
+    second_customer = await _register(client, CUSTOMER_B)
+    second = await _join_queue(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        service["id"],
+        staff_id=staff["id"],
+    )
+    await _accept_entry(client, owner["access_token"], second["id"])
+
+    before = await _track_entry(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        second["id"],
+    )
+    await _cancel_entry(
+        client,
+        business["id"],
+        first_customer["access_token"],
+        first["id"],
+    )
+    after = await _track_entry(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        second["id"],
+    )
+
+    assert before["position"] == 2
+    assert after["position"] == 1
+    assert after["customers_ahead"] == 0
+
+
+async def test_customer_tracking_eta_uses_service_duration(
+    client: AsyncClient,
+) -> None:
+    owner, business, service, staff, _customer, first = (
+        await _setup_staff_waiting_entry(client)
+    )
+    second_customer = await _register(client, CUSTOMER_B)
+    second = await _join_queue(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        service["id"],
+        staff_id=staff["id"],
+    )
+    await _accept_entry(client, owner["access_token"], second["id"])
+
+    body = await _track_entry(
+        client,
+        business["id"],
+        second_customer["access_token"],
+        second["id"],
+    )
+
+    assert first["id"] != body["entry_id"]
+    assert body["estimated_wait_minutes"] == 30
+    assert body["recommended_arrival_at"] is not None
+
+
+async def test_customer_tracking_called_and_in_service_eta_is_zero(
+    client: AsyncClient,
+) -> None:
+    owner, business, _service, _staff, customer, entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+    await _call_entry(client, owner["access_token"], entry["id"])
+
+    called = await _track_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+    await _start_service_entry(client, owner["access_token"], entry["id"])
+    in_service = await _track_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    assert called["status"] == "CALLED"
+    assert called["estimated_wait_minutes"] == 0
+    assert called["recommended_arrival_at"] is not None
+    assert in_service["status"] == "IN_SERVICE"
+    assert in_service["estimated_wait_minutes"] == 0
+    assert in_service["recommended_arrival_at"] is not None
+
+
+async def test_customer_tracking_general_queue_eta_is_null(
+    client: AsyncClient,
+) -> None:
+    _owner, business, _service, customer, entry = await _setup_waiting_entry(
+        client
+    )
+
+    body = await _track_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    assert body["staff_id"] is None
+    assert body["staff_name"] is None
+    assert body["position"] == 1
+    assert body["customers_ahead"] == 0
+    assert body["estimated_wait_minutes"] is None
+    assert body["recommended_arrival_at"] is None
+
+
+async def test_customer_tracking_terminal_entry_has_null_position_and_eta(
+    client: AsyncClient,
+) -> None:
+    _owner, business, _service, _staff, customer, entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+    await _cancel_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    body = await _track_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    assert body["status"] == "CANCELLED"
+    assert body["position"] is None
+    assert body["customers_ahead"] is None
+    assert body["estimated_wait_minutes"] is None
+    assert body["recommended_arrival_at"] is None
+    assert body["completed_at"] is not None
+
+
+async def test_customer_tracking_recommended_arrival_requires_eta(
+    client: AsyncClient,
+) -> None:
+    owner, business, service, staff, staff_customer, staff_entry = (
+        await _setup_staff_waiting_entry(client)
+    )
+    general_customer = await _register(client, CUSTOMER_B)
+    general_entry = await _join_queue(
+        client,
+        business["id"],
+        general_customer["access_token"],
+        service["id"],
+    )
+    await _accept_entry(client, owner["access_token"], general_entry["id"])
+
+    staff_tracking = await _track_entry(
+        client,
+        business["id"],
+        staff_customer["access_token"],
+        staff_entry["id"],
+    )
+    general_tracking = await _track_entry(
+        client,
+        business["id"],
+        general_customer["access_token"],
+        general_entry["id"],
+    )
+
+    assert staff["id"] == staff_tracking["staff_id"]
+    assert staff_tracking["estimated_wait_minutes"] == 0
+    assert staff_tracking["recommended_arrival_at"] is not None
+    assert general_tracking["estimated_wait_minutes"] is None
+    assert general_tracking["recommended_arrival_at"] is None

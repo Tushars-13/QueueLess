@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -26,6 +26,7 @@ from app.schemas.queue import (
     DailyQueueResponse,
     QueueEntryCreate,
     QueueEntryResponse,
+    QueueEntryTrackingResponse,
 )
 
 router = APIRouter(prefix="/businesses", tags=["queue"])
@@ -59,14 +60,18 @@ async def _business_for_queue(
     return business
 
 
-def _business_local_date(business: Business) -> date:
+def _business_now(business: Business) -> datetime:
     try:
         timezone = ZoneInfo(business.timezone)
     except (ValueError, ZoneInfoNotFoundError) as exc:
         raise AppError(
             "Business timezone is invalid", code="invalid_timezone"
         ) from exc
-    return datetime.now(timezone).date()
+    return datetime.now(timezone)
+
+
+def _business_local_date(business: Business) -> date:
+    return _business_now(business).date()
 
 
 async def _today_queue_or_none(
@@ -316,12 +321,11 @@ async def _load_customer_entry(
     business_id: int,
     entry_id: int,
     customer_id: int,
+    error_message: str = "You can only cancel your own queue entry",
 ) -> tuple[QueueEntry, DailyQueue]:
     entry, queue = await _load_queue_entry(db, entry_id, business_id)
     if entry.customer_id != customer_id:
-        raise ForbiddenError(
-            "You can only cancel your own queue entry", code="not_entry_owner"
-        )
+        raise ForbiddenError(error_message, code="not_entry_owner")
     return entry, queue
 
 
@@ -377,6 +381,58 @@ async def _ensure_staff_provides(
             "This staff member does not provide the selected service",
             code="staff_does_not_provide_service",
         )
+
+
+async def _tracking_resources(
+    db: AsyncSession, entry: QueueEntry, business_id: int
+) -> tuple[Service, Staff | None]:
+    service_result = await db.execute(
+        select(Service).where(
+            Service.id == entry.service_id,
+            Service.business_id == business_id,
+        )
+    )
+    service = service_result.scalar_one_or_none()
+    if service is None:
+        raise NotFoundError("Service not found", code="service_not_found")
+
+    staff = None
+    if entry.staff_id is not None:
+        staff_result = await db.execute(
+            select(Staff).where(
+                Staff.id == entry.staff_id,
+                Staff.business_id == business_id,
+            )
+        )
+        staff = staff_result.scalar_one_or_none()
+        if staff is None:
+            raise NotFoundError("Staff not found", code="staff_not_found")
+
+    return service, staff
+
+
+def _estimated_wait_minutes(
+    entry: QueueEntry, service: Service, position: int | None
+) -> int | None:
+    if entry.staff_id is None:
+        return None
+    if entry.status in (QueueEntryStatus.CALLED, QueueEntryStatus.IN_SERVICE):
+        return 0
+    if (
+        entry.status != QueueEntryStatus.WAITING
+        or position is None
+        or service.duration_minutes is None
+    ):
+        return None
+    return max(position - 1, 0) * service.duration_minutes
+
+
+def _recommended_arrival_at(
+    business: Business, estimated_wait_minutes: int | None
+) -> datetime | None:
+    if estimated_wait_minutes is None:
+        return None
+    return _business_now(business) + timedelta(minutes=estimated_wait_minutes)
 
 
 async def _active_for_customer(
@@ -685,6 +741,63 @@ async def cancel_queue_entry(
         from_status=from_status,
         to_status=QueueEntryStatus.CANCELLED,
         actor_id=customer.id,
+    )
+
+
+@router.get(
+    "/{business_id}/queue/entries/{entry_id}",
+    response_model=QueueEntryTrackingResponse,
+    summary="Track the authenticated customer's queue entry",
+)
+async def get_customer_queue_entry(
+    business_id: int,
+    entry_id: int,
+    db: DbSession,
+    customer: CurrentUser,
+) -> QueueEntryTrackingResponse:
+    if customer.role != UserRole.CUSTOMER:
+        raise ForbiddenError(
+            "Only customers can track queue entries", code="customer_required"
+        )
+
+    business = await _business_for_queue(db, business_id)
+    entry, queue = await _load_customer_entry(
+        db,
+        business_id=business_id,
+        entry_id=entry_id,
+        customer_id=customer.id,
+        error_message="You can only view your own queue entry",
+    )
+    service, staff = await _tracking_resources(db, entry, business.id)
+    position = (await _entry_positions(db, [entry])).get(entry.id)
+    customers_ahead = (
+        max(position - 1, 0) if position is not None else None
+    )
+    estimated_wait_minutes = _estimated_wait_minutes(
+        entry, service, position
+    )
+
+    return QueueEntryTrackingResponse(
+        entry_id=entry.id,
+        token_number=entry.token_number,
+        status=entry.status,
+        queue_date=queue.queue_date,
+        queue_status=queue.status,
+        service_id=service.id,
+        service_name=service.name,
+        duration_minutes=service.duration_minutes,
+        staff_id=entry.staff_id,
+        staff_name=staff.name if staff is not None else None,
+        position=position,
+        customers_ahead=customers_ahead,
+        estimated_wait_minutes=estimated_wait_minutes,
+        recommended_arrival_at=_recommended_arrival_at(
+            business, estimated_wait_minutes
+        ),
+        requested_at=entry.requested_at,
+        accepted_at=entry.accepted_at,
+        started_at=entry.started_at,
+        completed_at=entry.completed_at,
     )
 
 
