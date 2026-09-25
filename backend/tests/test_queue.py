@@ -170,6 +170,63 @@ async def _reject_entry(client: AsyncClient, token: str, entry_id: int) -> dict:
     return response.json()
 
 
+async def _call_entry(client: AsyncClient, token: str, entry_id: int) -> dict:
+    response = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry_id}/call", headers=_bearer(token)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _start_service_entry(
+    client: AsyncClient, token: str, entry_id: int
+) -> dict:
+    response = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry_id}/start-service",
+        headers=_bearer(token),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _complete_entry(client: AsyncClient, token: str, entry_id: int) -> dict:
+    response = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry_id}/complete", headers=_bearer(token)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _skip_entry(client: AsyncClient, token: str, entry_id: int) -> dict:
+    response = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry_id}/skip", headers=_bearer(token)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _no_show_entry(client: AsyncClient, token: str, entry_id: int) -> dict:
+    response = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry_id}/no-show", headers=_bearer(token)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _cancel_entry(
+    client: AsyncClient,
+    business_id: int,
+    token: str,
+    entry_id: int,
+) -> dict:
+    response = await client.post(
+        f"{BUSINESSES_PATH}/{business_id}/queue/entries/{entry_id}/cancel",
+        headers=_bearer(token),
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 async def _entry_snapshot(entry_id: int) -> dict:
     async with async_session_factory() as session:
         result = await session.execute(
@@ -181,6 +238,8 @@ async def _entry_snapshot(entry_id: int) -> dict:
             "status": entry.status,
             "token_number": entry.token_number,
             "accepted_at": entry.accepted_at,
+            "started_at": entry.started_at,
+            "completed_at": entry.completed_at,
         }
 
 
@@ -231,6 +290,25 @@ async def _setup_business_with_service(
     )
     service = await _create_service(client, owner["access_token"])
     return owner, business, service
+
+
+async def _setup_waiting_entry(
+    client: AsyncClient,
+    *,
+    owner_payload: dict = OWNER_A,
+    customer_payload: dict = CUSTOMER_A,
+    business_name: str = "Queue Salon",
+) -> tuple[dict, dict, dict, dict, dict]:
+    owner, business, service = await _setup_business_with_service(
+        client, owner_payload=owner_payload, business_name=business_name
+    )
+    customer = await _register(client, customer_payload)
+    await _open_queue(client, owner["access_token"])
+    entry = await _join_queue(
+        client, business["id"], customer["access_token"], service["id"]
+    )
+    accepted = await _accept_entry(client, owner["access_token"], entry["id"])
+    return owner, business, service, customer, accepted
 
 
 async def test_daily_queue_uses_business_local_date(
@@ -341,7 +419,7 @@ async def test_owner_can_view_today_queue(client: AsyncClient) -> None:
     assert body["last_token"] == 1
     assert body["total_entries"] == 2
     assert [entry["id"] for entry in body["entries"]] == [first["id"], second["id"]]
-    assert [entry["status"] for entry in body["entries"]] == ["ACCEPTED", "REQUESTED"]
+    assert [entry["status"] for entry in body["entries"]] == ["WAITING", "REQUESTED"]
     assert [entry["position"] for entry in body["entries"]] == [1, None]
 
     closed = await _close_queue(client, owner["access_token"])
@@ -660,11 +738,13 @@ async def test_owner_accept_sets_token_and_accepted_at(client: AsyncClient) -> N
     snapshot = await _entry_snapshot(entry["id"])
     queue = await _queue_snapshot(opened["id"])
 
-    assert accepted["status"] == "ACCEPTED"
+    assert accepted["status"] == "WAITING"
     assert accepted["token_number"] == 1
     assert accepted["accepted_at"] is not None
+    assert accepted["started_at"] is None
+    assert accepted["completed_at"] is None
     assert accepted["position"] == 1
-    assert snapshot["status"] == QueueEntryStatus.ACCEPTED
+    assert snapshot["status"] == QueueEntryStatus.WAITING
     assert snapshot["token_number"] == 1
     assert snapshot["accepted_at"] is not None
     assert queue["last_token"] == 1
@@ -673,6 +753,11 @@ async def test_owner_accept_sets_token_and_accepted_at(client: AsyncClient) -> N
         (
             QueueEntryStatus.REQUESTED.value,
             QueueEntryStatus.ACCEPTED.value,
+            owner["user"]["id"],
+        ),
+        (
+            QueueEntryStatus.ACCEPTED.value,
+            QueueEntryStatus.WAITING.value,
             owner["user"]["id"],
         ),
     ]
@@ -750,8 +835,9 @@ async def test_concurrent_accept_of_one_entry_is_single_winner(
     assert (await _entry_snapshot(entry["id"]))["token_number"] == 1
     assert (await _queue_snapshot(opened["id"]))["last_token"] == 1
     events = await _event_snapshot(entry["id"])
-    assert len(events) == 2
+    assert len(events) == 3
     assert events[1][1] == QueueEntryStatus.ACCEPTED.value
+    assert events[2][1] == QueueEntryStatus.WAITING.value
 
 
 async def test_accept_and_reject_race_has_one_winner(
@@ -782,8 +868,9 @@ async def test_accept_and_reject_race_has_one_winner(
     snapshot = await _entry_snapshot(entry["id"])
     queue = await _queue_snapshot(opened["id"])
     assert snapshot["status"] == winner.json()["status"]
-    assert len(await _event_snapshot(entry["id"])) == 2
-    if snapshot["status"] == QueueEntryStatus.ACCEPTED:
+    events = await _event_snapshot(entry["id"])
+    assert len(events) == (3 if snapshot["status"] == QueueEntryStatus.WAITING else 2)
+    if snapshot["status"] == QueueEntryStatus.WAITING:
         assert snapshot["token_number"] == 1
         assert queue["last_token"] == 1
     else:
@@ -823,6 +910,11 @@ async def test_concurrent_accepts_allocate_distinct_tokens(
     assert [response.status_code for response in responses] == [200, 200]
     tokens = sorted(response.json()["token_number"] for response in responses)
     assert tokens == [1, 2]
+    positions = {
+        response.json()["token_number"]: response.json()["position"]
+        for response in responses
+    }
+    assert positions == {1: 1, 2: 2}
     assert (await _queue_snapshot(opened["id"]))["last_token"] == 2
 
 
@@ -869,3 +961,294 @@ async def test_owner_cannot_accept_or_reject_cross_business_entry(
         )
         assert response.status_code == 404
         assert response.json()["code"] == "queue_entry_not_found"
+
+
+async def test_owner_call_moves_waiting_entry_to_called(client: AsyncClient) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+
+    called = await _call_entry(client, owner["access_token"], entry["id"])
+
+    assert called["status"] == "CALLED"
+    assert called["position"] == 1
+    assert called["started_at"] is None
+    events = await _event_snapshot(entry["id"])
+    assert events[-1] == (
+        QueueEntryStatus.WAITING.value,
+        QueueEntryStatus.CALLED.value,
+        owner["user"]["id"],
+    )
+
+
+async def test_owner_starts_service_from_called_entry(client: AsyncClient) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+    await _call_entry(client, owner["access_token"], entry["id"])
+
+    started = await _start_service_entry(client, owner["access_token"], entry["id"])
+
+    assert started["status"] == "IN_SERVICE"
+    assert started["position"] == 1
+    assert started["started_at"] is not None
+    assert started["completed_at"] is None
+    events = await _event_snapshot(entry["id"])
+    assert events[-1] == (
+        QueueEntryStatus.CALLED.value,
+        QueueEntryStatus.IN_SERVICE.value,
+        owner["user"]["id"],
+    )
+
+
+async def test_owner_cannot_start_service_from_waiting_entry(client: AsyncClient) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+
+    response = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry['id']}/start-service",
+        headers=_bearer(owner["access_token"]),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "invalid_transition"
+    snapshot = await _entry_snapshot(entry["id"])
+    assert snapshot["status"] == QueueEntryStatus.WAITING
+    assert snapshot["started_at"] is None
+    events = await _event_snapshot(entry["id"])
+    assert events[-1] == (
+        QueueEntryStatus.ACCEPTED.value,
+        QueueEntryStatus.WAITING.value,
+        owner["user"]["id"],
+    )
+
+
+async def test_owner_completes_in_service_entry(client: AsyncClient) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+    await _call_entry(client, owner["access_token"], entry["id"])
+    await _start_service_entry(client, owner["access_token"], entry["id"])
+
+    completed = await _complete_entry(client, owner["access_token"], entry["id"])
+
+    assert completed["status"] == "COMPLETED"
+    assert completed["position"] is None
+    assert completed["completed_at"] is not None
+    events = await _event_snapshot(entry["id"])
+    assert events[-1] == (
+        QueueEntryStatus.IN_SERVICE.value,
+        QueueEntryStatus.COMPLETED.value,
+        owner["user"]["id"],
+    )
+
+
+async def test_owner_can_skip_waiting_and_called_entries(client: AsyncClient) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    customer_a = await _register(client, CUSTOMER_A)
+    customer_b = await _register(client, CUSTOMER_B)
+    await _open_queue(client, owner["access_token"])
+    entry_a = await _join_queue(
+        client, business["id"], customer_a["access_token"], service["id"]
+    )
+    entry_b = await _join_queue(
+        client, business["id"], customer_b["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner["access_token"], entry_a["id"])
+    await _accept_entry(client, owner["access_token"], entry_b["id"])
+    await _call_entry(client, owner["access_token"], entry_b["id"])
+
+    skipped_a = await _skip_entry(client, owner["access_token"], entry_a["id"])
+    skipped_b = await _skip_entry(client, owner["access_token"], entry_b["id"])
+
+    assert skipped_a["status"] == "SKIPPED"
+    assert skipped_a["position"] is None
+    assert skipped_a["completed_at"] is not None
+    assert skipped_b["status"] == "SKIPPED"
+    assert skipped_b["position"] is None
+    assert skipped_b["completed_at"] is not None
+    assert (await _event_snapshot(entry_a["id"]))[-1] == (
+        QueueEntryStatus.WAITING.value,
+        QueueEntryStatus.SKIPPED.value,
+        owner["user"]["id"],
+    )
+    assert (await _event_snapshot(entry_b["id"]))[-1] == (
+        QueueEntryStatus.CALLED.value,
+        QueueEntryStatus.SKIPPED.value,
+        owner["user"]["id"],
+    )
+
+
+async def test_owner_can_mark_waiting_and_called_entries_as_no_show(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    customer_a = await _register(client, CUSTOMER_A)
+    customer_b = await _register(client, CUSTOMER_B)
+    await _open_queue(client, owner["access_token"])
+    entry_a = await _join_queue(
+        client, business["id"], customer_a["access_token"], service["id"]
+    )
+    entry_b = await _join_queue(
+        client, business["id"], customer_b["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner["access_token"], entry_a["id"])
+    await _accept_entry(client, owner["access_token"], entry_b["id"])
+    await _call_entry(client, owner["access_token"], entry_b["id"])
+
+    no_show_a = await _no_show_entry(client, owner["access_token"], entry_a["id"])
+    no_show_b = await _no_show_entry(client, owner["access_token"], entry_b["id"])
+
+    assert no_show_a["status"] == "NO_SHOW"
+    assert no_show_a["position"] is None
+    assert no_show_a["completed_at"] is not None
+    assert no_show_b["status"] == "NO_SHOW"
+    assert no_show_b["position"] is None
+    assert no_show_b["completed_at"] is not None
+    assert (await _event_snapshot(entry_a["id"]))[-1] == (
+        QueueEntryStatus.WAITING.value,
+        QueueEntryStatus.NO_SHOW.value,
+        owner["user"]["id"],
+    )
+    assert (await _event_snapshot(entry_b["id"]))[-1] == (
+        QueueEntryStatus.CALLED.value,
+        QueueEntryStatus.NO_SHOW.value,
+        owner["user"]["id"],
+    )
+
+
+async def test_customer_cancels_own_waiting_entry(client: AsyncClient) -> None:
+    owner, business, service, customer, entry = await _setup_waiting_entry(client)
+    second_customer = await _register(client, CUSTOMER_B)
+    second_entry = await _join_queue(
+        client, business["id"], second_customer["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner["access_token"], second_entry["id"])
+
+    cancelled = await _cancel_entry(
+        client,
+        business["id"],
+        customer["access_token"],
+        entry["id"],
+    )
+
+    assert cancelled["status"] == "CANCELLED"
+    assert cancelled["position"] is None
+    assert cancelled["completed_at"] is not None
+    events = await _event_snapshot(entry["id"])
+    assert events[-1] == (
+        QueueEntryStatus.WAITING.value,
+        QueueEntryStatus.CANCELLED.value,
+        customer["user"]["id"],
+    )
+    queue = await client.get(
+        ME_QUEUE_PATH, headers=_bearer(owner["access_token"])
+    )
+    assert queue.status_code == 200, queue.text
+    assert next(
+        row for row in queue.json()["entries"] if row["id"] == second_entry["id"]
+    )["position"] == 1
+
+
+async def test_invalid_queue_transitions_are_rejected(client: AsyncClient) -> None:
+    owner, business, _service, customer, entry = await _setup_waiting_entry(client)
+    owner_headers = _bearer(owner["access_token"])
+    customer_headers = _bearer(customer["access_token"])
+
+    await _call_entry(client, owner["access_token"], entry["id"])
+    invalid_complete = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry['id']}/complete",
+        headers=owner_headers,
+    )
+    invalid_cancel = await client.post(
+        f"{BUSINESSES_PATH}/{business['id']}/queue/entries/{entry['id']}/cancel",
+        headers=customer_headers,
+    )
+    assert invalid_complete.status_code == 409
+    assert invalid_complete.json()["code"] == "invalid_transition"
+    assert invalid_cancel.status_code == 409
+    assert invalid_cancel.json()["code"] == "invalid_transition"
+
+    skipped = await _skip_entry(client, owner["access_token"], entry["id"])
+    assert skipped["status"] == "SKIPPED"
+    invalid_call = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry['id']}/call", headers=owner_headers
+    )
+    assert invalid_call.status_code == 409
+    assert invalid_call.json()["code"] == "invalid_transition"
+
+
+async def test_cross_business_owner_cannot_perform_lifecycle_actions(
+    client: AsyncClient,
+) -> None:
+    owner_a, business_a, service_a = await _setup_business_with_service(client)
+    customer = await _register(client, CUSTOMER_A)
+    await _open_queue(client, owner_a["access_token"])
+    entry = await _join_queue(
+        client, business_a["id"], customer["access_token"], service_a["id"]
+    )
+    owner_b = await _register(client, OWNER_B)
+    await _create_business(client, owner_b["access_token"], name="Other Queue Salon")
+    headers = _bearer(owner_b["access_token"])
+
+    for action in ("call", "start-service", "complete", "skip", "no-show"):
+        response = await client.post(
+            f"{ME_QUEUE_PATH}/entries/{entry['id']}/{action}", headers=headers
+        )
+        assert response.status_code == 404, (action, response.text)
+        assert response.json()["code"] == "queue_entry_not_found"
+
+
+async def test_customer_cannot_cancel_another_customers_entry(client: AsyncClient) -> None:
+    _owner, business, _service, _customer, entry = await _setup_waiting_entry(client)
+    other_customer = await _register(client, CUSTOMER_B)
+
+    response = await client.post(
+        f"{BUSINESSES_PATH}/{business['id']}/queue/entries/{entry['id']}/cancel",
+        headers=_bearer(other_customer["access_token"]),
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["code"] == "not_entry_owner"
+    assert (await _entry_snapshot(entry["id"]))["status"] == QueueEntryStatus.WAITING
+
+
+async def test_concurrent_call_and_cancel_have_one_winner(client: AsyncClient) -> None:
+    owner, business, _service, customer, entry = await _setup_waiting_entry(client)
+    responses = await asyncio.wait_for(
+        asyncio.gather(
+            client.post(
+                f"{ME_QUEUE_PATH}/entries/{entry['id']}/call",
+                headers=_bearer(owner["access_token"]),
+            ),
+            client.post(
+                f"{BUSINESSES_PATH}/{business['id']}/queue/entries/{entry['id']}/cancel",
+                headers=_bearer(customer["access_token"]),
+            ),
+        ),
+        timeout=15,
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 409], [
+        response.text for response in responses
+    ]
+    snapshot = await _entry_snapshot(entry["id"])
+    assert snapshot["status"] in (QueueEntryStatus.CALLED, QueueEntryStatus.CANCELLED)
+    assert len(await _event_snapshot(entry["id"])) == 4
+
+
+async def test_concurrent_owner_actions_have_one_winner(client: AsyncClient) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+    responses = await asyncio.wait_for(
+        asyncio.gather(
+            client.post(
+                f"{ME_QUEUE_PATH}/entries/{entry['id']}/call",
+                headers=_bearer(owner["access_token"]),
+            ),
+            client.post(
+                f"{ME_QUEUE_PATH}/entries/{entry['id']}/complete",
+                headers=_bearer(owner["access_token"]),
+            ),
+        ),
+        timeout=15,
+    )
+
+    assert sorted(response.status_code for response in responses) == [200, 409], [
+        response.text for response in responses
+    ]
+    snapshot = await _entry_snapshot(entry["id"])
+    assert snapshot["status"] == QueueEntryStatus.CALLED
+    assert len(await _event_snapshot(entry["id"])) == 4

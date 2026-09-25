@@ -20,6 +20,8 @@ class QueueEntryResponse(BaseModel):
     status: QueueEntryStatus
     requested_at: datetime
     accepted_at: datetime | None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     position: int | None = None
     notes: str | None
 

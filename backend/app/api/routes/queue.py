@@ -13,10 +13,15 @@ from app.db.session import get_db_session
 from app.models.business import Business
 from app.models.daily_queue import DailyQueue
 from app.models.enums import DailyQueueStatus, QueueEntryStatus, UserRole
-from app.models.queue_entry import ACTIVE_QUEUE_STATUSES, QueueEntry
+from app.models.queue_entry import (
+    ACTIVE_QUEUE_STATUSES,
+    QUEUE_POSITION_STATUSES,
+    QueueEntry,
+)
 from app.models.queue_event import QueueEvent
 from app.models.service import Service
 from app.models.staff import Staff, staff_services
+from app.models.user import User
 from app.schemas.queue import (
     DailyQueueResponse,
     QueueEntryCreate,
@@ -93,7 +98,7 @@ async def _entry_positions(
         select(QueueEntry)
         .where(
             QueueEntry.daily_queue_id.in_(queue_ids),
-            QueueEntry.status.in_(ACTIVE_QUEUE_STATUSES),
+            QueueEntry.status.in_(QUEUE_POSITION_STATUSES),
             QueueEntry.accepted_at.is_not(None),
         )
         .order_by(QueueEntry.accepted_at, QueueEntry.id)
@@ -138,14 +143,13 @@ async def _queue_with_entries(
     )
 
 
-async def _load_queue_entry_for_update(
+async def _load_queue_entry(
     db: AsyncSession, entry_id: int, business_id: int
 ) -> tuple[QueueEntry, DailyQueue]:
     result = await db.execute(
         select(QueueEntry, DailyQueue)
         .join(DailyQueue, QueueEntry.daily_queue_id == DailyQueue.id)
         .where(QueueEntry.id == entry_id, DailyQueue.business_id == business_id)
-        .with_for_update()
     )
     row = result.one_or_none()
     if row is None:
@@ -178,6 +182,8 @@ def _entry_response(
         status=entry.status,
         requested_at=entry.requested_at,
         accepted_at=entry.accepted_at,
+        started_at=entry.started_at,
+        completed_at=entry.completed_at,
         position=position,
         notes=entry.notes,
     )
@@ -217,30 +223,106 @@ async def _allocate_token(db: AsyncSession, queue_id: int) -> int:
     return int(token)
 
 
-async def _claim_requested_entry(
+async def _claim_entry_transition(
     db: AsyncSession,
     entry: QueueEntry,
+    source_status: QueueEntryStatus,
     target: QueueEntryStatus,
     *,
-    token_number: int | None = None,
+    values: dict[str, object] | None = None,
 ) -> bool:
-    values = {"status": target, "updated_at": func.now()}
-    if target == QueueEntryStatus.ACCEPTED:
-        values["accepted_at"] = func.now()
-        values["token_number"] = token_number
+    update_values: dict[str, object] = {
+        "status": target,
+        "updated_at": func.now(),
+    }
+    if values is not None:
+        update_values.update(values)
 
     result = await db.execute(
         update(QueueEntry)
         .where(
             QueueEntry.id == entry.id,
             QueueEntry.daily_queue_id == entry.daily_queue_id,
-            QueueEntry.status == QueueEntryStatus.REQUESTED,
+            QueueEntry.status == source_status,
         )
-        .values(**values)
+        .values(**update_values)
         .returning(QueueEntry.id)
         .execution_options(synchronize_session=False)
     )
     return result.scalar_one_or_none() is not None
+
+
+async def _finish_entry_transition(
+    db: AsyncSession,
+    entry: QueueEntry,
+    *,
+    business_id: int,
+    from_status: QueueEntryStatus,
+    to_status: QueueEntryStatus,
+    actor_id: int,
+) -> QueueEntryResponse:
+    await db.refresh(entry)
+    _create_event(
+        db,
+        queue_entry=entry,
+        business_id=business_id,
+        from_status=from_status,
+        to_status=to_status,
+        actor_id=actor_id,
+    )
+    await db.commit()
+    return (await _entry_responses(db, [entry]))[0]
+
+
+async def _transition_owned_entry(
+    db: AsyncSession,
+    owner: User,
+    entry_id: int,
+    source_statuses: tuple[QueueEntryStatus, ...],
+    target: QueueEntryStatus,
+    *,
+    values: dict[str, object] | None = None,
+) -> QueueEntryResponse:
+    business = await _owner_business(db, owner.id)
+    entry, _queue = await _load_queue_entry(db, entry_id, business.id)
+    if entry.status not in source_statuses:
+        await db.rollback()
+        raise ConflictError(
+            "Queue entry is not in a valid state for this action",
+            code="invalid_transition",
+        )
+    from_status = entry.status
+    if not await _claim_entry_transition(
+        db, entry, from_status, target, values=values
+    ):
+        await db.rollback()
+        raise ConflictError(
+            "Queue entry is not in a valid state for this action",
+            code="invalid_transition",
+        )
+    return await _finish_entry_transition(
+        db,
+        entry,
+        business_id=business.id,
+        from_status=from_status,
+        to_status=target,
+        actor_id=owner.id,
+    )
+
+
+async def _load_customer_entry(
+    db: AsyncSession,
+    *,
+    business_id: int,
+    entry_id: int,
+    customer_id: int,
+) -> tuple[QueueEntry, DailyQueue]:
+    entry, queue = await _load_queue_entry(db, entry_id, business_id)
+    if entry.customer_id != customer_id:
+        raise ForbiddenError(
+            "You can only cancel your own queue entry", code="not_entry_owner"
+        )
+    return entry, queue
 
 
 async def _service_for_business(
@@ -395,11 +477,18 @@ async def accept_entry(
     db: DbSession,
     owner: CurrentOwner,
 ) -> QueueEntryResponse:
-    business = await _owner_business(db, owner.id, for_update=True)
-    entry, queue = await _load_queue_entry_for_update(db, entry_id, business.id)
+    business = await _owner_business(db, owner.id)
+    entry, queue = await _load_queue_entry(db, entry_id, business.id)
     token = await _allocate_token(db, queue.id)
-    if not await _claim_requested_entry(
-        db, entry, QueueEntryStatus.ACCEPTED, token_number=token
+    if not await _claim_entry_transition(
+        db,
+        entry,
+        QueueEntryStatus.REQUESTED,
+        QueueEntryStatus.WAITING,
+        values={
+            "accepted_at": func.clock_timestamp(),
+            "token_number": token,
+        },
     ):
         await db.rollback()
         raise ConflictError(
@@ -414,6 +503,14 @@ async def accept_entry(
         business_id=business.id,
         from_status=QueueEntryStatus.REQUESTED,
         to_status=QueueEntryStatus.ACCEPTED,
+        actor_id=owner.id,
+    )
+    _create_event(
+        db,
+        queue_entry=entry,
+        business_id=business.id,
+        from_status=QueueEntryStatus.ACCEPTED,
+        to_status=QueueEntryStatus.WAITING,
         actor_id=owner.id,
     )
     await db.commit()
@@ -431,26 +528,164 @@ async def reject_entry(
     db: DbSession,
     owner: CurrentOwner,
 ) -> QueueEntryResponse:
-    business = await _owner_business(db, owner.id, for_update=True)
-    entry, _queue = await _load_queue_entry_for_update(db, entry_id, business.id)
-    if not await _claim_requested_entry(db, entry, QueueEntryStatus.REJECTED):
-        await db.rollback()
-        raise ConflictError(
-            "Queue entry is no longer awaiting rejection",
-            code="invalid_transition",
+    return await _transition_owned_entry(
+        db,
+        owner,
+        entry_id,
+        (QueueEntryStatus.REQUESTED,),
+        QueueEntryStatus.REJECTED,
+        values={"completed_at": func.now()},
+    )
+
+
+@router.post(
+    "/me/queue/entries/{entry_id}/call",
+    response_model=QueueEntryResponse,
+    summary="Call a waiting queue entry",
+)
+async def call_entry(
+    entry_id: int,
+    db: DbSession,
+    owner: CurrentOwner,
+) -> QueueEntryResponse:
+    return await _transition_owned_entry(
+        db,
+        owner,
+        entry_id,
+        (QueueEntryStatus.WAITING,),
+        QueueEntryStatus.CALLED,
+    )
+
+
+@router.post(
+    "/me/queue/entries/{entry_id}/start-service",
+    response_model=QueueEntryResponse,
+    summary="Start service for a queue entry",
+)
+async def start_service_entry(
+    entry_id: int,
+    db: DbSession,
+    owner: CurrentOwner,
+) -> QueueEntryResponse:
+    return await _transition_owned_entry(
+        db,
+        owner,
+        entry_id,
+        (QueueEntryStatus.CALLED,),
+        QueueEntryStatus.IN_SERVICE,
+        values={"started_at": func.now()},
+    )
+
+
+@router.post(
+    "/me/queue/entries/{entry_id}/complete",
+    response_model=QueueEntryResponse,
+    summary="Complete service for a queue entry",
+)
+async def complete_entry(
+    entry_id: int,
+    db: DbSession,
+    owner: CurrentOwner,
+) -> QueueEntryResponse:
+    return await _transition_owned_entry(
+        db,
+        owner,
+        entry_id,
+        (QueueEntryStatus.IN_SERVICE,),
+        QueueEntryStatus.COMPLETED,
+        values={"completed_at": func.now()},
+    )
+
+
+@router.post(
+    "/me/queue/entries/{entry_id}/skip",
+    response_model=QueueEntryResponse,
+    summary="Skip a waiting or called queue entry",
+)
+async def skip_entry(
+    entry_id: int,
+    db: DbSession,
+    owner: CurrentOwner,
+) -> QueueEntryResponse:
+    return await _transition_owned_entry(
+        db,
+        owner,
+        entry_id,
+        (QueueEntryStatus.WAITING, QueueEntryStatus.CALLED),
+        QueueEntryStatus.SKIPPED,
+        values={"completed_at": func.now()},
+    )
+
+
+@router.post(
+    "/me/queue/entries/{entry_id}/no-show",
+    response_model=QueueEntryResponse,
+    summary="Mark a waiting or called queue entry as a no-show",
+)
+async def mark_no_show_entry(
+    entry_id: int,
+    db: DbSession,
+    owner: CurrentOwner,
+) -> QueueEntryResponse:
+    return await _transition_owned_entry(
+        db,
+        owner,
+        entry_id,
+        (QueueEntryStatus.WAITING, QueueEntryStatus.CALLED),
+        QueueEntryStatus.NO_SHOW,
+        values={"completed_at": func.now()},
+    )
+
+
+@router.post(
+    "/{business_id}/queue/entries/{entry_id}/cancel",
+    response_model=QueueEntryResponse,
+    summary="Cancel the authenticated customer's waiting queue entry",
+)
+async def cancel_queue_entry(
+    business_id: int,
+    entry_id: int,
+    db: DbSession,
+    customer: CurrentUser,
+) -> QueueEntryResponse:
+    if customer.role != UserRole.CUSTOMER:
+        raise ForbiddenError(
+            "Only customers can cancel queue entries", code="customer_required"
         )
 
-    await db.refresh(entry)
-    _create_event(
+    entry, queue = await _load_customer_entry(
         db,
-        queue_entry=entry,
-        business_id=business.id,
-        from_status=QueueEntryStatus.REQUESTED,
-        to_status=QueueEntryStatus.REJECTED,
-        actor_id=owner.id,
+        business_id=business_id,
+        entry_id=entry_id,
+        customer_id=customer.id,
     )
-    await db.commit()
-    return (await _entry_responses(db, [entry]))[0]
+    if entry.status != QueueEntryStatus.WAITING:
+        await db.rollback()
+        raise ConflictError(
+            "Only waiting queue entries can be cancelled",
+            code="invalid_transition",
+        )
+    from_status = entry.status
+    if not await _claim_entry_transition(
+        db,
+        entry,
+        from_status,
+        QueueEntryStatus.CANCELLED,
+        values={"completed_at": func.now()},
+    ):
+        await db.rollback()
+        raise ConflictError(
+            "Only waiting queue entries can be cancelled",
+            code="invalid_transition",
+        )
+    return await _finish_entry_transition(
+        db,
+        entry,
+        business_id=queue.business_id,
+        from_status=from_status,
+        to_status=QueueEntryStatus.CANCELLED,
+        actor_id=customer.id,
+    )
 
 
 @router.post(

@@ -28,10 +28,16 @@ if TYPE_CHECKING:
     from app.models.staff import Staff
     from app.models.user import User
 
-# Statuses that indicate an entry is actively occupying a queue position.
+# Statuses that keep a customer from joining another active entry.
 ACTIVE_QUEUE_STATUSES = (
     QueueEntryStatus.REQUESTED,
     QueueEntryStatus.ACCEPTED,
+    QueueEntryStatus.WAITING,
+    QueueEntryStatus.CALLED,
+    QueueEntryStatus.IN_SERVICE,
+)
+
+QUEUE_POSITION_STATUSES = (
     QueueEntryStatus.WAITING,
     QueueEntryStatus.CALLED,
     QueueEntryStatus.IN_SERVICE,
