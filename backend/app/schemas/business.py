@@ -2,8 +2,17 @@
 
 from datetime import datetime, time
 from decimal import Decimal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _validate_timezone(value: str) -> str:
+    try:
+        ZoneInfo(value)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("timezone must be a valid IANA timezone") from exc
+    return value
 
 
 class BusinessCreate(BaseModel):
@@ -18,6 +27,11 @@ class BusinessCreate(BaseModel):
         default=None, ge=Decimal("-180"), le=Decimal("180")
     )
     timezone: str = Field(default="UTC", min_length=1, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_must_be_valid(cls, value: str) -> str:
+        return _validate_timezone(value)
 
     @model_validator(mode="after")
     def _coordinates_together(self) -> "BusinessCreate":
@@ -40,6 +54,11 @@ class BusinessUpdate(BaseModel):
         default=None, ge=Decimal("-180"), le=Decimal("180")
     )
     timezone: str | None = Field(default=None, min_length=1, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def _timezone_must_be_valid(cls, value: str | None) -> str | None:
+        return _validate_timezone(value) if value is not None else None
 
     @model_validator(mode="after")
     def _coordinates_together(self) -> "BusinessUpdate":
