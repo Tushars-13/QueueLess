@@ -2,6 +2,10 @@
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import update
+
+from app.db.session import async_session_factory
+from app.models.business import Business
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
 
@@ -20,6 +24,12 @@ OWNER_B = {
     "email": "owner-b@example.com",
     "password": "password123",
     "full_name": "Owner B",
+    "role": "BUSINESS_OWNER",
+}
+OWNER_C = {
+    "email": "owner-c@example.com",
+    "password": "password123",
+    "full_name": "Owner C",
     "role": "BUSINESS_OWNER",
 }
 CUSTOMER = {
@@ -57,6 +67,36 @@ async def _register_owner(client: AsyncClient) -> dict:
 async def _create_business(client: AsyncClient, token: str) -> dict:
     resp = await client.post(BUSINESSES_PATH, json=BUSINESS_PAYLOAD, headers=_bearer(token))
     assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def _create_business_with(
+    client: AsyncClient, owner_payload: dict, **overrides
+) -> dict:
+    """Create a business for a fresh owner, overriding BUSINESS_PAYLOAD fields."""
+    owner = await _register(client, owner_payload)
+    payload = {**BUSINESS_PAYLOAD, **overrides}
+    resp = await client.post(
+        BUSINESSES_PATH, json=payload, headers=_bearer(owner["access_token"])
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def _set_business_active(business_id: int, is_active: bool) -> None:
+    """Toggle is_active directly; the owner API deliberately cannot change it."""
+    async with async_session_factory() as session:
+        await session.execute(
+            update(Business).where(Business.id == business_id).values(is_active=is_active)
+        )
+        await session.commit()
+
+
+async def _discover(client: AsyncClient, token: str, **params) -> dict:
+    resp = await client.get(
+        BUSINESSES_PATH, params=params, headers=_bearer(token)
+    )
+    assert resp.status_code == 200, resp.text
     return resp.json()
 
 
@@ -292,3 +332,312 @@ async def test_opening_hours_roundtrip_and_validation(
     replaced = await client.put(ME_HOURS_PATH, json={"hours": closed_week}, headers=headers)
     assert replaced.status_code == 200
     assert all(row["is_closed"] for row in replaced.json())
+
+
+# --- customer discovery (GET /businesses) ----------------------------------
+
+
+async def test_discovery_requires_authentication(client: AsyncClient) -> None:
+    resp = await client.get(BUSINESSES_PATH)
+
+    assert resp.status_code == 401, resp.text
+    assert resp.json()["code"] == "missing_token"
+
+
+async def test_discovery_is_empty_when_no_business_exists(
+    client: AsyncClient,
+) -> None:
+    customer = await _register(client, CUSTOMER)
+
+    body = await _discover(client, customer["access_token"])
+
+    assert body["items"] == []
+    assert body["has_more"] is False
+
+
+async def test_discovery_returns_active_businesses(client: AsyncClient) -> None:
+    created = await _create_business_with(
+        client, OWNER_A, name="Sunshine Salon", category="salon"
+    )
+    customer = await _register(client, CUSTOMER)
+
+    body = await _discover(client, customer["access_token"])
+
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["id"] == created["id"]
+    assert item["name"] == "Sunshine Salon"
+    assert item["category"] == "salon"
+    assert item["is_active"] is True
+
+
+async def test_discovery_excludes_inactive_businesses(client: AsyncClient) -> None:
+    created = await _create_business_with(client, OWNER_A, name="Closed Shop")
+    await _set_business_active(created["id"], False)
+    customer = await _register(client, CUSTOMER)
+
+    body = await _discover(client, customer["access_token"])
+
+    assert [item["id"] for item in body["items"]] == []
+
+
+async def test_discovery_allows_business_owners_too(client: AsyncClient) -> None:
+    created = await _create_business_with(client, OWNER_A, name="Sunshine Salon")
+    other_owner = await _register(client, OWNER_B)
+
+    body = await _discover(client, other_owner["access_token"])
+
+    assert [item["id"] for item in body["items"]] == [created["id"]]
+
+
+async def test_discovery_q_matches_name_substring_case_insensitively(
+    client: AsyncClient,
+) -> None:
+    created = await _create_business_with(client, OWNER_A, name="Sunshine Salon")
+    await _create_business_with(client, OWNER_B, name="City Clinic")
+    customer = await _register(client, CUSTOMER)
+    token = customer["access_token"]
+
+    lower = await _discover(client, token, q="sunshine")
+    upper = await _discover(client, token, q="SUNSHINE")
+    middle = await _discover(client, token, q="Shine Sal")
+
+    assert [item["id"] for item in lower["items"]] == [created["id"]]
+    assert [item["id"] for item in upper["items"]] == [created["id"]]
+    assert [item["id"] for item in middle["items"]] == [created["id"]]
+
+
+async def test_discovery_q_searches_name_only(client: AsyncClient) -> None:
+    await _create_business_with(
+        client,
+        OWNER_A,
+        name="Sunshine Salon",
+        description="A cozy neighborhood salon",
+        address="1 Main Street",
+        category="salon",
+    )
+    customer = await _register(client, CUSTOMER)
+    token = customer["access_token"]
+
+    # "neighborhood" only appears in the description.
+    from_description = await _discover(client, token, q="neighborhood")
+    from_address = await _discover(client, token, q="Main Street")
+
+    assert from_description["items"] == []
+    assert from_address["items"] == []
+
+
+async def test_discovery_q_treats_sql_wildcards_literally(client: AsyncClient) -> None:
+    await _create_business_with(client, OWNER_A, name="Sunshine Salon")
+    customer = await _register(client, CUSTOMER)
+
+    everything = await _discover(client, customer["access_token"], q="%")
+    underscore = await _discover(client, customer["access_token"], q="_unshine")
+
+    assert everything["items"] == []
+    assert underscore["items"] == []
+
+
+async def test_discovery_filters_by_category_exactly(client: AsyncClient) -> None:
+    salon = await _create_business_with(client, OWNER_A, category="salon")
+    await _create_business_with(client, OWNER_B, category="clinic")
+    customer = await _register(client, CUSTOMER)
+    token = customer["access_token"]
+
+    exact = await _discover(client, token, category="salon")
+    prefix = await _discover(client, token, category="salo")
+
+    assert [item["id"] for item in exact["items"]] == [salon["id"]]
+    assert prefix["items"] == []
+
+
+async def test_discovery_nearby_uses_a_bounding_box(client: AsyncClient) -> None:
+    centre = await _create_business_with(
+        client,
+        OWNER_A,
+        name="Centre Shop",
+        latitude=28.613939,
+        longitude=77.209021,
+    )
+    # Inside the 0.1-degree box on both axes.
+    corner = await _create_business_with(
+        client,
+        OWNER_B,
+        name="Corner Shop",
+        latitude=28.65,
+        longitude=77.25,
+    )
+    # Outside on latitude only.
+    await _create_business_with(
+        client,
+        OWNER_C,
+        name="Far Shop",
+        latitude=28.80,
+        longitude=77.209021,
+    )
+    customer = await _register(client, CUSTOMER)
+
+    body = await _discover(
+        client, customer["access_token"], latitude=28.613939, longitude=77.209021
+    )
+
+    assert sorted(item["id"] for item in body["items"]) == sorted(
+        [centre["id"], corner["id"]]
+    )
+
+
+async def test_discovery_rejects_latitude_without_longitude(
+    client: AsyncClient,
+) -> None:
+    customer = await _register(client, CUSTOMER)
+
+    resp = await client.get(
+        BUSINESSES_PATH,
+        params={"latitude": 28.613939},
+        headers=_bearer(customer["access_token"]),
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "validation_error"
+
+
+async def test_discovery_rejects_longitude_without_latitude(
+    client: AsyncClient,
+) -> None:
+    customer = await _register(client, CUSTOMER)
+
+    resp = await client.get(
+        BUSINESSES_PATH,
+        params={"longitude": 77.209021},
+        headers=_bearer(customer["access_token"]),
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "validation_error"
+
+
+async def test_discovery_combines_all_filters(client: AsyncClient) -> None:
+    wanted = await _create_business_with(
+        client,
+        OWNER_A,
+        name="Sunshine Salon",
+        category="salon",
+        latitude=28.613939,
+        longitude=77.209021,
+    )
+    # Right name and category, wrong location.
+    await _create_business_with(
+        client,
+        OWNER_B,
+        name="Sunshine Spa",
+        category="salon",
+        latitude=10.0,
+        longitude=10.0,
+    )
+    # Right name and location, wrong category.
+    await _create_business_with(
+        client,
+        OWNER_C,
+        name="Sunshine Clinic",
+        category="clinic",
+        latitude=28.613939,
+        longitude=77.209021,
+    )
+    customer = await _register(client, CUSTOMER)
+
+    body = await _discover(
+        client,
+        customer["access_token"],
+        q="sunshine",
+        category="salon",
+        latitude=28.613939,
+        longitude=77.209021,
+    )
+
+    assert [item["id"] for item in body["items"]] == [wanted["id"]]
+
+
+async def test_discovery_paginates_with_limit_and_offset(client: AsyncClient) -> None:
+    first = await _create_business_with(client, OWNER_A, name="Alpha")
+    second = await _create_business_with(client, OWNER_B, name="Beta")
+    third = await _create_business_with(client, OWNER_C, name="Gamma")
+    customer = await _register(client, CUSTOMER)
+    token = customer["access_token"]
+
+    page_one = await _discover(client, token, limit=2, offset=0)
+    page_two = await _discover(client, token, limit=2, offset=2)
+
+    assert [item["id"] for item in page_one["items"]] == [first["id"], second["id"]]
+    assert [item["id"] for item in page_two["items"]] == [third["id"]]
+
+
+async def test_discovery_validates_pagination_bounds(client: AsyncClient) -> None:
+    customer = await _register(client, CUSTOMER)
+    headers = _bearer(customer["access_token"])
+
+    zero_limit = await client.get(BUSINESSES_PATH, params={"limit": 0}, headers=headers)
+    huge_limit = await client.get(BUSINESSES_PATH, params={"limit": 101}, headers=headers)
+    negative_offset = await client.get(
+        BUSINESSES_PATH, params={"offset": -1}, headers=headers
+    )
+
+    assert zero_limit.status_code == 422
+    assert huge_limit.status_code == 422
+    assert negative_offset.status_code == 422
+
+
+async def test_discovery_orders_deterministically_by_id(client: AsyncClient) -> None:
+    created = [
+        await _create_business_with(client, payload, name=f"Shop {index}")
+        for index, payload in enumerate((OWNER_A, OWNER_B, OWNER_C), start=1)
+    ]
+    customer = await _register(client, CUSTOMER)
+    token = customer["access_token"]
+
+    first_read = await _discover(client, token)
+    second_read = await _discover(client, token)
+
+    expected = sorted(business["id"] for business in created)
+    assert [item["id"] for item in first_read["items"]] == expected
+    assert [item["id"] for item in second_read["items"]] == expected
+
+
+async def test_discovery_has_more_reflects_a_following_page(
+    client: AsyncClient,
+) -> None:
+    await _create_business_with(client, OWNER_A, name="Alpha")
+    await _create_business_with(client, OWNER_B, name="Beta")
+    customer = await _register(client, CUSTOMER)
+    token = customer["access_token"]
+
+    exact_fit = await _discover(client, token, limit=2)
+    smaller_page = await _discover(client, token, limit=5)
+    more_available = await _discover(client, token, limit=1)
+
+    assert len(exact_fit["items"]) == 2
+    assert exact_fit["has_more"] is True
+    assert smaller_page["has_more"] is False
+    assert more_available["has_more"] is True
+
+
+async def test_discovery_items_do_not_expose_owner_id(client: AsyncClient) -> None:
+    await _create_business_with(client, OWNER_A, name="Sunshine Salon")
+    customer = await _register(client, CUSTOMER)
+
+    body = await _discover(client, customer["access_token"])
+
+    assert set(body) == {"items", "has_more"}
+    assert "owner_id" not in body["items"][0]
+    assert set(body["items"][0]) == {
+        "id",
+        "name",
+        "category",
+        "description",
+        "address",
+        "latitude",
+        "longitude",
+        "timezone",
+        "is_active",
+        "created_at",
+        "updated_at",
+    }

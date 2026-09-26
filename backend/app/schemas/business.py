@@ -117,6 +117,13 @@ class PublicBusinessResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class BusinessListResponse(BaseModel):
+    """A page of public business profiles for customer discovery."""
+
+    items: list[PublicBusinessResponse]
+    has_more: bool
+
+
 class BusinessHourInput(BaseModel):
     """A single weekday's opening hours.
 

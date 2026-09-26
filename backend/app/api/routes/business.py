@@ -1,8 +1,10 @@
 """Business-owner business-profile endpoints."""
 
+from decimal import Decimal
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +16,7 @@ from app.schemas.business import (
     BusinessCreate,
     BusinessHourResponse,
     BusinessHoursPayload,
+    BusinessListResponse,
     BusinessResponse,
     BusinessUpdate,
     PublicBusinessResponse,
@@ -22,6 +25,16 @@ from app.schemas.business import (
 router = APIRouter(prefix="/businesses", tags=["businesses"])
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
+
+MAX_LIMIT = 100
+DEFAULT_LIMIT = 20
+
+# Half-width of the nearby-search rectangle, in degrees. Nearby search is a
+# bounding box on (latitude, longitude) -- NOT a true radius/distance search --
+# so results are a rectangle rather than a circle and are not distance-ranked.
+# 0.1 degrees of latitude is roughly 11 km; the same value bounds longitude.
+# See docs/database-design.md section 7 ("Indexes (query support)").
+NEARBY_DEGREE_RADIUS = Decimal("0.1")
 
 
 async def _get_owned_business(db: AsyncSession, owner_id: int) -> Business:
@@ -40,6 +53,31 @@ async def _load_hours(db: AsyncSession, business_id: int) -> list[BusinessHour]:
         .order_by(BusinessHour.day_of_week)
     )
     return list(result.scalars())
+
+
+def _contains_pattern(term: str) -> str:
+    """Build a case-insensitive substring LIKE pattern with wildcards escaped."""
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _require_coordinate_pair(
+    latitude: float | None, longitude: float | None
+) -> None:
+    """Reject a half-specified location with the standard request-validation 422."""
+    if (latitude is None) == (longitude is None):
+        return
+    missing = "longitude" if latitude is not None else "latitude"
+    raise RequestValidationError(
+        [
+            {
+                "type": "value_error",
+                "loc": ("query", missing),
+                "msg": "latitude and longitude must be provided together",
+                "input": None,
+            }
+        ]
+    )
 
 
 @router.post(
@@ -157,3 +195,62 @@ async def get_business_by_id(
     if business is None:
         raise NotFoundError("Business not found", code="business_not_found")
     return PublicBusinessResponse.model_validate(business)
+
+
+@router.get(
+    "",
+    response_model=BusinessListResponse,
+    summary="Search and discover active businesses",
+)
+async def list_businesses(
+    db: DbSession,
+    user: CurrentUser,
+    q: Annotated[str | None, Query(max_length=255)] = None,
+    category: Annotated[str | None, Query(max_length=100)] = None,
+    latitude: Annotated[float | None, Query(ge=-90, le=90)] = None,
+    longitude: Annotated[float | None, Query(ge=-180, le=180)] = None,
+    limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> BusinessListResponse:
+    """List active businesses for customer discovery.
+
+    All filters are optional and combine with AND. ``q`` is a case-insensitive
+    substring match on the business name, ``category`` is an exact match, and
+    ``latitude``/``longitude`` (which must be supplied together) restrict
+    results to a fixed bounding box -- see ``NEARBY_DEGREE_RADIUS``.
+    """
+    _require_coordinate_pair(latitude, longitude)
+
+    query = select(Business).where(Business.is_active.is_(True))
+
+    if q is not None:
+        query = query.where(Business.name.ilike(_contains_pattern(q), escape="\\"))
+    if category is not None:
+        query = query.where(Business.category == category)
+
+    if latitude is not None and longitude is not None:
+        # NUMERIC(9,6) columns: compare against Decimal, not float.
+        centre_latitude = Decimal(str(latitude))
+        centre_longitude = Decimal(str(longitude))
+        query = query.where(
+            Business.latitude.between(
+                centre_latitude - NEARBY_DEGREE_RADIUS,
+                centre_latitude + NEARBY_DEGREE_RADIUS,
+            ),
+            Business.longitude.between(
+                centre_longitude - NEARBY_DEGREE_RADIUS,
+                centre_longitude + NEARBY_DEGREE_RADIUS,
+            ),
+        )
+
+    result = await db.execute(
+        query.order_by(Business.id).limit(limit).offset(offset)
+    )
+    businesses = result.scalars().all()
+    return BusinessListResponse(
+        items=[
+            PublicBusinessResponse.model_validate(business)
+            for business in businesses
+        ],
+        has_more=len(businesses) == limit,
+    )
