@@ -218,6 +218,14 @@ Append-only audit trail of every state transition. Feeds **notifications** and *
 
 ### 3.11 `notifications`
 
+Persisted, in-app only. The MVP writes one row per user-facing queue event, in
+the **same transaction** as the corresponding state change (§11.6). The emitted
+types are `QUEUE_ACCEPTED` (entry accepted), `REQUEST_REJECTED` (entry
+rejected), `TURN_REACHED` (entry called), and `QUEUE_CLOSED` (daily queue
+closed, fanned out to the entries that were still active). `TURN_APPROACHING`
+is defined but not emitted — no threshold has been decided — and `GENERAL` is
+reserved for messages that belong to no single queue entry.
+
 | Column          | Type               | Nullable | Notes                                   |
 | --------------- | ------------------ | -------- | --------------------------------------- |
 | `id`            | `BIGSERIAL`        | PK       |                                         |
@@ -332,6 +340,9 @@ CREATE INDEX idx_business_location ON businesses(latitude, longitude);
 
 -- Notifications inbox
 CREATE INDEX idx_notification_user ON notifications(user_id, is_read);
+
+-- Notifications inbox listing (newest first) for one user
+CREATE INDEX ix_notifications_user_created ON notifications(user_id, created_at, id);
 
 -- Resolve daily queue for a business/day
 CREATE INDEX idx_daily_queue_biz_date ON daily_queues(business_id, queue_date);
@@ -459,10 +470,17 @@ Solved by the atomic single-row `UPDATE` on `daily_queues.last_token` (§8), whi
 
 Each state change writes:
 1. the guarded `queue_entries` update (the authoritative state), **and**
-2. the corresponding `queue_events` audit row, and optionally
-3. a `notifications` row
+2. the corresponding `queue_events` audit row, and
+3. a `notifications` row whenever the transition has a user-facing meaning
+   (the mapping in §3.11)
 
 …all within **one transaction**, so state, audit trail, and notification are always consistent. Redis/WebSocket fan-out happens *after* commit and is treated as best-effort live refresh — never the source of truth.
+
+Because notifications are written only **after** a transition has been claimed
+successfully, a retried or concurrent action cannot produce a duplicate: the
+guard returns no row, the request is rejected, and no notification is staged.
+`daily_queues` is closed with the same guarded conditional update, so a repeated
+close is rejected with `409 queue_closed` instead of re-notifying customers.
 
 ---
 

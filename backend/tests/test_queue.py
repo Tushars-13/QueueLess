@@ -8,7 +8,8 @@ from sqlalchemy import select
 from app.api.routes import queue as queue_route
 from app.db.session import async_session_factory
 from app.models.daily_queue import DailyQueue
-from app.models.enums import QueueEntryStatus
+from app.models.enums import NotificationType, QueueEntryStatus
+from app.models.notification import Notification
 from app.models.queue_entry import QueueEntry
 from app.models.queue_event import QueueEvent
 
@@ -285,6 +286,25 @@ async def _event_snapshot(entry_id: int) -> list[tuple[str | None, str, int | No
                 event.actor_id,
             )
             for event in result.scalars()
+        ]
+
+
+async def _notification_snapshot(
+    entry_id: int,
+) -> list[tuple[str, int, bool]]:
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(Notification)
+            .where(Notification.queue_entry_id == entry_id)
+            .order_by(Notification.id)
+        )
+        return [
+            (
+                notification.type.value,
+                notification.user_id,
+                notification.is_read,
+            )
+            for notification in result.scalars()
         ]
 
 
@@ -1586,3 +1606,221 @@ async def test_customer_tracking_recommended_arrival_requires_eta(
     assert staff_tracking["recommended_arrival_at"] is not None
     assert general_tracking["estimated_wait_minutes"] is None
     assert general_tracking["recommended_arrival_at"] is None
+
+
+async def test_accept_creates_one_queue_accepted_notification(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    customer = await _register(client, CUSTOMER_A)
+    await _open_queue(client, owner["access_token"])
+    entry = await _join_queue(
+        client, business["id"], customer["access_token"], service["id"]
+    )
+
+    assert await _notification_snapshot(entry["id"]) == []
+
+    await _accept_entry(client, owner["access_token"], entry["id"])
+
+    assert await _notification_snapshot(entry["id"]) == [
+        (NotificationType.QUEUE_ACCEPTED.value, customer["user"]["id"], False)
+    ]
+
+
+async def test_reject_creates_request_rejected_notification(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    customer = await _register(client, CUSTOMER_A)
+    await _open_queue(client, owner["access_token"])
+    entry = await _join_queue(
+        client, business["id"], customer["access_token"], service["id"]
+    )
+
+    await _reject_entry(client, owner["access_token"], entry["id"])
+
+    assert await _notification_snapshot(entry["id"]) == [
+        (NotificationType.REQUEST_REJECTED.value, customer["user"]["id"], False)
+    ]
+
+
+async def test_call_creates_turn_reached_notification(
+    client: AsyncClient,
+) -> None:
+    owner, _business, _service, customer, entry = await _setup_waiting_entry(client)
+
+    assert [item[0] for item in await _notification_snapshot(entry["id"])] == [
+        NotificationType.QUEUE_ACCEPTED.value
+    ]
+
+    await _call_entry(client, owner["access_token"], entry["id"])
+
+    assert await _notification_snapshot(entry["id"]) == [
+        (NotificationType.QUEUE_ACCEPTED.value, customer["user"]["id"], False),
+        (NotificationType.TURN_REACHED.value, customer["user"]["id"], False),
+    ]
+
+
+async def test_untargeted_transitions_create_no_notification(
+    client: AsyncClient,
+) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+    owner_token = owner["access_token"]
+
+    # WAITING -> CALLED -> IN_SERVICE -> COMPLETED is the only legal path.
+    # CALL is targeted (TURN_REACHED); start-service and complete are not.
+    await _call_entry(client, owner_token, entry["id"])
+    await _start_service_entry(client, owner_token, entry["id"])
+    await _complete_entry(client, owner_token, entry["id"])
+
+    assert [item[0] for item in await _notification_snapshot(entry["id"])] == [
+        NotificationType.QUEUE_ACCEPTED.value,
+        NotificationType.TURN_REACHED.value,
+    ]
+
+
+async def test_skip_and_no_show_create_no_notification(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    await _open_queue(client, owner["access_token"])
+    owner_token = owner["access_token"]
+
+    customer_a = await _register(client, CUSTOMER_A)
+    customer_b = await _register(client, CUSTOMER_B)
+    skipped = await _join_queue(
+        client, business["id"], customer_a["access_token"], service["id"]
+    )
+    no_showed = await _join_queue(
+        client, business["id"], customer_b["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner_token, skipped["id"])
+    await _accept_entry(client, owner_token, no_showed["id"])
+
+    await _skip_entry(client, owner_token, skipped["id"])
+    await _no_show_entry(client, owner_token, no_showed["id"])
+
+    for entry_id in (skipped["id"], no_showed["id"]):
+        assert [item[0] for item in await _notification_snapshot(entry_id)] == [
+            NotificationType.QUEUE_ACCEPTED.value
+        ]
+
+
+async def test_customer_cancel_creates_no_notification(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    customer = await _register(client, CUSTOMER_A)
+    await _open_queue(client, owner["access_token"])
+    entry = await _join_queue(
+        client, business["id"], customer["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner["access_token"], entry["id"])
+
+    await _cancel_entry(
+        client, business["id"], customer["access_token"], entry["id"]
+    )
+
+    assert [item[0] for item in await _notification_snapshot(entry["id"])] == [
+        NotificationType.QUEUE_ACCEPTED.value
+    ]
+
+
+async def test_close_queue_notifies_only_active_entries(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    await _open_queue(client, owner["access_token"])
+    owner_token = owner["access_token"]
+
+    served = await _register(client, CUSTOMER_A)
+    waiting = await _register(client, CUSTOMER_B)
+    pending = await _register(client, CUSTOMER_C)
+
+    served_entry = await _join_queue(
+        client, business["id"], served["access_token"], service["id"]
+    )
+    waiting_entry = await _join_queue(
+        client, business["id"], waiting["access_token"], service["id"]
+    )
+    pending_entry = await _join_queue(
+        client, business["id"], pending["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner_token, served_entry["id"])
+    await _accept_entry(client, owner_token, waiting_entry["id"])
+    await _call_entry(client, owner_token, served_entry["id"])
+    await _start_service_entry(client, owner_token, served_entry["id"])
+    await _complete_entry(client, owner_token, served_entry["id"])
+
+    await _close_queue(client, owner_token)
+
+    # COMPLETED is terminal, so the served customer is not told again.
+    assert [item[0] for item in await _notification_snapshot(served_entry["id"])] == [
+        NotificationType.QUEUE_ACCEPTED.value,
+        NotificationType.TURN_REACHED.value,
+    ]
+    for entry_id in (waiting_entry["id"], pending_entry["id"]):
+        assert NotificationType.QUEUE_CLOSED.value in {
+            item[0] for item in await _notification_snapshot(entry_id)
+        }
+
+
+async def test_closing_an_already_closed_queue_is_rejected(
+    client: AsyncClient,
+) -> None:
+    owner, _business, _service, _customer, entry = await _setup_waiting_entry(client)
+    await _close_queue(client, owner["access_token"])
+    after_first_close = await _notification_snapshot(entry["id"])
+
+    response = await client.post(
+        CLOSE_QUEUE_PATH, headers=_bearer(owner["access_token"])
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "queue_closed"
+    assert await _notification_snapshot(entry["id"]) == after_first_close
+
+
+async def test_repeated_accept_does_not_duplicate_notification(
+    client: AsyncClient,
+) -> None:
+    owner, business, service = await _setup_business_with_service(client)
+    customer = await _register(client, CUSTOMER_A)
+    await _open_queue(client, owner["access_token"])
+    entry = await _join_queue(
+        client, business["id"], customer["access_token"], service["id"]
+    )
+    await _accept_entry(client, owner["access_token"], entry["id"])
+
+    repeated = await client.post(
+        f"{ME_QUEUE_PATH}/entries/{entry['id']}/accept",
+        headers=_bearer(owner["access_token"]),
+    )
+
+    assert repeated.status_code == 409, repeated.text
+    assert repeated.json()["code"] == "invalid_transition"
+    assert await _notification_snapshot(entry["id"]) == [
+        (NotificationType.QUEUE_ACCEPTED.value, customer["user"]["id"], False)
+    ]
+
+
+async def test_concurrent_calls_create_one_turn_reached_notification(
+    client: AsyncClient,
+) -> None:
+    owner, _business, _service, customer, entry = await _setup_waiting_entry(client)
+    path = f"{ME_QUEUE_PATH}/entries/{entry['id']}/call"
+    headers = _bearer(owner["access_token"])
+
+    responses = await asyncio.wait_for(
+        asyncio.gather(
+            *(client.post(path, headers=headers) for _ in range(2))
+        ),
+        timeout=15,
+    )
+
+    statuses = sorted(response.status_code for response in responses)
+    assert statuses == [200, 409]
+    assert await _notification_snapshot(entry["id"]) == [
+        (NotificationType.QUEUE_ACCEPTED.value, customer["user"]["id"], False),
+        (NotificationType.TURN_REACHED.value, customer["user"]["id"], False),
+    ]

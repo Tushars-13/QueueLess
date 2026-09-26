@@ -12,7 +12,13 @@ from app.core.exceptions import AppError, ConflictError, ForbiddenError, NotFoun
 from app.db.session import get_db_session
 from app.models.business import Business
 from app.models.daily_queue import DailyQueue
-from app.models.enums import DailyQueueStatus, QueueEntryStatus, UserRole
+from app.models.enums import (
+    DailyQueueStatus,
+    NotificationType,
+    QueueEntryStatus,
+    UserRole,
+)
+from app.models.notification import Notification
 from app.models.queue_entry import (
     ACTIVE_QUEUE_STATUSES,
     QUEUE_POSITION_STATUSES,
@@ -32,6 +38,33 @@ from app.schemas.queue import (
 router = APIRouter(prefix="/businesses", tags=["queue"])
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
+
+# Entry statuses that raise a customer notification when reached. TURN_APPROACHING
+# is deliberately absent: no threshold is defined for it yet.
+NOTIFICATION_TYPES_BY_STATUS: dict[QueueEntryStatus, NotificationType] = {
+    QueueEntryStatus.WAITING: NotificationType.QUEUE_ACCEPTED,
+    QueueEntryStatus.REJECTED: NotificationType.REQUEST_REJECTED,
+    QueueEntryStatus.CALLED: NotificationType.TURN_REACHED,
+}
+
+NOTIFICATION_COPY: dict[NotificationType, tuple[str, str]] = {
+    NotificationType.QUEUE_ACCEPTED: (
+        "Your queue request was accepted",
+        "You are in the queue now. We will let you know when it is your turn.",
+    ),
+    NotificationType.REQUEST_REJECTED: (
+        "Your queue request was declined",
+        "The business could not accept your request for today.",
+    ),
+    NotificationType.TURN_REACHED: (
+        "It is your turn",
+        "Please proceed to the service area.",
+    ),
+    NotificationType.QUEUE_CLOSED: (
+        "The queue is now closed",
+        "The business closed today's queue. Please contact them for details.",
+    ),
+}
 
 
 async def _owner_business(
@@ -214,6 +247,62 @@ def _create_event(
     )
 
 
+def _create_notification(
+    db: AsyncSession,
+    *,
+    user_id: int,
+    queue_entry_id: int,
+    notification_type: NotificationType,
+) -> None:
+    """Stage a notification; it is persisted by the caller's commit."""
+    title, body = NOTIFICATION_COPY[notification_type]
+    db.add(
+        Notification(
+            user_id=user_id,
+            title=title,
+            body=body,
+            type=notification_type,
+            queue_entry_id=queue_entry_id,
+        )
+    )
+
+
+def _create_status_notification(
+    db: AsyncSession,
+    queue_entry: QueueEntry,
+    to_status: QueueEntryStatus,
+) -> None:
+    """Notify the customer when ``to_status`` has a mapped notification type."""
+    notification_type = NOTIFICATION_TYPES_BY_STATUS.get(to_status)
+    if notification_type is None:
+        return
+    _create_notification(
+        db,
+        user_id=queue_entry.customer_id,
+        queue_entry_id=queue_entry.id,
+        notification_type=notification_type,
+    )
+
+
+async def _create_queue_closed_notifications(
+    db: AsyncSession, queue_id: int
+) -> None:
+    """Tell every customer still holding an active entry that the day is over."""
+    result = await db.execute(
+        select(QueueEntry.id, QueueEntry.customer_id).where(
+            QueueEntry.daily_queue_id == queue_id,
+            QueueEntry.status.in_(ACTIVE_QUEUE_STATUSES),
+        )
+    )
+    for entry_id, customer_id in result.all():
+        _create_notification(
+            db,
+            user_id=customer_id,
+            queue_entry_id=entry_id,
+            notification_type=NotificationType.QUEUE_CLOSED,
+        )
+
+
 async def _allocate_token(db: AsyncSession, queue_id: int) -> int:
     result = await db.execute(
         update(DailyQueue)
@@ -257,6 +346,23 @@ async def _claim_entry_transition(
     return result.scalar_one_or_none() is not None
 
 
+async def _claim_daily_queue_close(
+    db: AsyncSession, queue: DailyQueue
+) -> bool:
+    """Guarded OPEN -> CLOSED transition; False when already closed."""
+    result = await db.execute(
+        update(DailyQueue)
+        .where(
+            DailyQueue.id == queue.id,
+            DailyQueue.status == DailyQueueStatus.OPEN,
+        )
+        .values(status=DailyQueueStatus.CLOSED, updated_at=func.now())
+        .returning(DailyQueue.id)
+        .execution_options(synchronize_session=False)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def _finish_entry_transition(
     db: AsyncSession,
     entry: QueueEntry,
@@ -275,6 +381,7 @@ async def _finish_entry_transition(
         to_status=to_status,
         actor_id=actor_id,
     )
+    _create_status_notification(db, entry, to_status)
     await db.commit()
     return (await _entry_responses(db, [entry]))[0]
 
@@ -498,7 +605,10 @@ async def close_daily_queue(
             "No daily queue is open for this business today",
             code="daily_queue_not_found",
         )
-    queue.status = DailyQueueStatus.CLOSED
+    if not await _claim_daily_queue_close(db, queue):
+        await db.rollback()
+        raise ConflictError("This queue is closed for the day", code="queue_closed")
+    await _create_queue_closed_notifications(db, queue.id)
     await db.commit()
     await db.refresh(queue)
     return await _queue_with_entries(db, queue)
@@ -569,6 +679,7 @@ async def accept_entry(
         to_status=QueueEntryStatus.WAITING,
         actor_id=owner.id,
     )
+    _create_status_notification(db, entry, QueueEntryStatus.WAITING)
     await db.commit()
     return (await _entry_responses(db, [entry]))[0]
 

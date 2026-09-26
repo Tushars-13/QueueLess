@@ -32,6 +32,8 @@ class Notification(Base):
 
     __table_args__ = (
         Index("ix_notifications_user_status", "user_id", "is_read"),
+        # Notification inbox: one user's rows ordered newest first.
+        Index("ix_notifications_user_created", "user_id", "created_at", "id"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -75,21 +77,26 @@ class Notification(Base):
     ) -> int:
         """Number of unread notifications for a user."""
         result = await session.execute(
-            select(cls.is_read).where(
-                cls.user_id == user_id, cls.is_read.is_(False)
-            )
+            select(func.count())
+            .select_from(cls)
+            .where(cls.user_id == user_id, cls.is_read.is_(False))
         )
-        return len(result.scalars().all())
+        return int(result.scalar_one())
 
     @classmethod
     async def latest(
-        cls, session: AsyncSession, user_id: int, limit: int = 20
+        cls,
+        session: AsyncSession,
+        user_id: int,
+        limit: int = 20,
+        offset: int = 0,
     ) -> Sequence["Notification"]:
-        """Most recent notifications for a user, newest first."""
+        """A page of a user's notifications, newest first."""
         result = await session.execute(
             select(cls)
             .where(cls.user_id == user_id)
             .order_by(cls.created_at.desc(), cls.id.desc())
             .limit(limit)
+            .offset(offset)
         )
         return result.scalars().all()
